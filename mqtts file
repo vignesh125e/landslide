@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <title>Landslide Monitoring Dashboard</title>
+
+  <style>
+    body {
+      font-family: 'Segoe UI', sans-serif;
+      background: #f0f2f5;
+      margin: 0;
+      padding: 20px;
+    }
+
+    h1 {
+      text-align: center;
+      color: #2c3e50;
+      margin-bottom: 20px;
+    }
+
+    .alert,
+    .survivor-box {
+      max-width: 600px;
+      margin: 10px auto;
+      padding: 16px;
+      border-radius: 10px;
+      text-align: center;
+      font-size: 18px;
+      font-weight: bold;
+      box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+    }
+
+    .alert-danger {
+      background: #ff4d4f;
+      color: white;
+      animation: blink 1s infinite;
+    }
+
+    .alert-safe {
+      background: #4caf50;
+      color: white;
+    }
+
+    .survivor-box.safe {
+      background-color: #e0f7e9;
+      color: #2e7d32;
+      border: 2px solid #66bb6a;
+    }
+
+    .survivor-box.danger {
+      background-color: #ffebee;
+      color: #c62828;
+      border: 2px solid #ef5350;
+      animation: blinkSurvivor 1s infinite;
+    }
+
+    @keyframes blink {
+      50% {
+        opacity: 0.3;
+      }
+    }
+
+    @keyframes blinkSurvivor {
+      50% {
+        opacity: 0.6;
+      }
+    }
+
+    .card-container {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 20px;
+      margin: 20px 0;
+    }
+
+    .card {
+      background: #fff;
+      border-radius: 16px;
+      box-shadow: 0 4px 10px rgba(0, 0, 0, 0.1);
+      width: 200px;
+      padding: 20px;
+      text-align: center;
+    }
+
+    .card h2 {
+      font-size: 1.2em;
+      color: #34495e;
+      margin-bottom: 10px;
+    }
+
+    .card .value {
+      font-size: 2em;
+      font-weight: bold;
+      color: #2980b9;
+    }
+
+    table {
+      width: 100%;
+      max-width: 1000px;
+      margin: 30px auto;
+      border-collapse: collapse;
+      background: white;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 3px 10px rgba(0, 0, 0, 0.1);
+    }
+
+    th,
+    td {
+      padding: 12px;
+      text-align: center;
+      border-bottom: 1px solid #eee;
+    }
+
+    th {
+      background-color: #3498db;
+      color: white;
+    }
+
+    tr:hover {
+      background-color: #f6f9fc;
+    }
+  </style>
+</head>
+
+<body>
+
+  <h1>Landslide Monitoring Dashboard</h1>
+
+  <div id="landslide-alert" class="alert alert-safe">✅ System Normal</div>
+  <div id="survivor-status" class="survivor-box safe">✅ No Survivor Detected</div>
+
+  <!-- LIVE SENSOR CARDS -->
+  <div class="card-container">
+    <div class="card">
+      <h2>Humidity</h2>
+      <div class="value" id="live-humidity">--%</div>
+    </div>
+    <div class="card">
+      <h2>Moisture</h2>
+      <div class="value" id="live-moisture">--</div>
+    </div>
+    <div class="card">
+      <h2>Vibration</h2>
+      <div class="value" id="live-vibration">--</div>
+    </div>
+    <div class="card">
+      <h2>Temperature</h2>
+      <div class="value" id="live-temperature">--°C</div>
+    </div>
+  </div>
+
+  <!-- TABLE DATA FROM THINGSPEAK -->
+  <table id="sensor-table">
+    <thead>
+      <tr>
+        <th>Time</th>
+        <th>Humidity (%)</th>
+        <th>Moisture</th>
+        <th>Vibration</th>
+        <th>Temperature (°C)</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <!-- MQTT LIBRARY -->
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+
+  <script>
+    // MQTT Connection
+    const client = mqtt.connect("wss://broker.emqx.io:8084/mqtt");
+
+    const alertDiv = document.getElementById("landslide-alert");
+    const survivorDiv = document.getElementById("survivor-status");
+
+    const fields = {
+      humidity: document.getElementById("live-humidity"),
+      moisture: document.getElementById("live-moisture"),
+      vibration: document.getElementById("live-vibration"),
+      temperature: document.getElementById("live-temperature")
+    };
+
+    let latestData = {
+      humidity: 0,
+      moisture: 0,
+      vibration: 0,
+      temperature: 0
+    };
+
+    client.on("connect", () => {
+      console.log("MQTT connected");
+      client.subscribe("landslide/#");
+    });
+
+    client.on("message", (topic, message) => {
+      const field = topic.split("/")[1];
+      const value = parseFloat(message.toString());
+
+      latestData[field] = value;
+
+      if (fields[field]) {
+        fields[field].textContent =
+          field === "temperature" ? `${value}°C` :
+            field === "humidity" ? `${value}%` :
+              value;
+      }
+
+      updateLandslideAlert();
+      updateSurvivorAlert();
+    });
+
+    // Landslide Logic
+    function updateLandslideAlert() {
+      const { humidity, moisture, vibration } = latestData;
+
+      if (humidity > 55 && moisture < 3500 && vibration === 1) {
+        alertDiv.className = "alert alert-danger";
+        alertDiv.textContent = "⚠️ High Landslide Risk Detected!";
+      } else {
+        alertDiv.className = "alert alert-safe";
+        alertDiv.textContent = "✅ All Clear – No Landslide Risk";
+      }
+    }
+
+    // Survivor Logic
+    function updateSurvivorAlert() {
+      const { vibration, temperature } = latestData;
+
+      if (vibration === 1 && temperature >= 34 && temperature <= 38) {
+        survivorDiv.className = "survivor-box danger";
+        survivorDiv.textContent = "🚨 Survivor Possibly Detected – Rescue Needed!";
+      } else {
+        survivorDiv.className = "survivor-box safe";
+        survivorDiv.textContent = "✅ No Survivor Detected";
+      }
+    }
+
+    // ThingSpeak Table
+    const channelID = 2446560;
+    const updateInterval = 20000;
+
+    async function updateTable() {
+      try {
+        const res = await fetch(
+          `https://api.thingspeak.com/channels/${channelID}/feeds.json?results=5`
+        );
+        const data = await res.json();
+
+        const tbody = document.querySelector("#sensor-table tbody");
+        tbody.innerHTML = "";
+
+        data.feeds.reverse().forEach(feed => {
+          const row = document.createElement("tr");
+          row.innerHTML = `
+            <td>${new Date(feed.created_at).toLocaleString()}</td>
+            <td>${feed.field1 || "--"}</td>
+            <td>${feed.field2 || "--"}</td>
+            <td>${feed.field3 || "--"}</td>
+            <td>${feed.field4 || "--"}</td>
+          `;
+          tbody.appendChild(row);
+        });
+
+      } catch (error) {
+        console.error("ThingSpeak fetch error:", error);
+      }
+    }
+
+    updateTable();
+    setInterval(updateTable, updateInterval);
+  </script>
+
+</body>
+
+</html>
