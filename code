@@ -1,0 +1,419 @@
+
+
+#include <Arduino.h>
+#include <DHT.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include "ThingSpeak.h"
+
+// FreeRTOS headers
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "freertos/queue.h"
+
+// --- WiFi ---
+const char* ssid = "land";
+const char* password = "12345678";
+WiFiClient client;
+
+// --- ThingSpeak ---
+unsigned long myChannelNumber = 2446560;
+const char * myWriteAPIKey = "4H4L2WG5QUUB7PY2";
+
+// --- MQTT ---
+const char* mqtt_server = "broker.emqx.io";
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+// --- Pin Definitions ---
+#define DHTPIN 4
+#define DHTTYPE DHT11
+#define MoisturePin 34
+#define VibrationPin 35
+#define NTCTempPin 32
+#define BuzzerPin 18
+
+// --- Objects ---
+DHT dht(DHTPIN, DHTTYPE);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+HardwareSerial sim800(1); // UART1 for SIM800L (RX=26, TX=27)
+
+// --- Thresholds ---
+const float HumidityThreshold = 55.0;
+const int MoistureThreshold = 3500; // calibrate: higher ADC may mean wetter depending on sensor
+const int VibrationDetected = 1;
+const float HumanTempMin = 27.0;
+const float HumanTempMax = 31.0;
+
+// --- RTOS primitives ---
+SemaphoreHandle_t lcdMutex;
+SemaphoreHandle_t dataMutex;      // protects lastSent
+QueueHandle_t sensorQueue;        // length 1: latest snapshot only
+QueueHandle_t sim800Queue;        // commands to SIM800
+
+// --- Data structures ---
+typedef struct 
+{
+  float humidity;
+  int moisture;
+  int vibration;
+  float temp;
+} SensorData_t;
+
+typedef enum
+{
+  SIM800_SEND_SMS,
+  SIM800_CALL
+} Sim800CmdType;
+
+typedef struct
+{
+  Sim800CmdType type;
+  char phone[20];
+  char message[160]; // for SMS
+} Sim800Cmd_t;
+
+// --- Previous data ---
+SensorData_t lastSent = { -1.0, -1, -1, -1.0 };
+
+// --- Timing control (ThingSpeak) ---
+unsigned long lastThingSpeakUpdate = 0;
+
+// Forward declarations
+void TaskSensor(void * pvParameters);
+void TaskMQTT(void * pvParameters);
+void TaskThingSpeak(void * pvParameters);
+void TaskSIM800(void * pvParameters);
+void TaskLCD(void * pvParameters);
+void connectMQTT();
+bool ensureWiFiConnected(unsigned long timeoutMs = 20000);
+void publishMQTT(const char* topic, const String& message);
+float readNTCTemperature();
+void sendSim800SMSBlocking(const char* phone, const char* message);
+void makeSim800CallBlocking(const char* phone);
+
+void setup() 
+{
+  Serial.begin(115200);
+  delay(100);
+
+  // initialize peripherals
+  dht.begin();
+  lcd.init();
+  lcd.backlight();
+
+  pinMode(VibrationPin, INPUT);
+  pinMode(BuzzerPin, OUTPUT);
+  digitalWrite(BuzzerPin, LOW);
+
+  // SIM800 on UART1: RX=26 (SIM800 TX), TX=27 (SIM800 RX)
+  sim800.begin(9600, SERIAL_8N1, 26, 27);
+
+  // Attempt WiFi connect with a timeout
+  if (!ensureWiFiConnected(20000))
+  {
+    Serial.println("WiFi connect failed (timeout). Continuing; tasks may retry.");
+  } 
+  else 
+  {
+    lcd.clear();
+    lcd.setCursor(0,0);
+    lcd.print("WiFi Connected");
+  }
+
+  ThingSpeak.begin(client);
+  mqttClient.setServer(mqtt_server, 1883);
+  // connectMQTT() will be called in MQTT task (non-blocking here)
+
+  // Create mutexes and queues
+  lcdMutex = xSemaphoreCreateMutex();
+  dataMutex = xSemaphoreCreateMutex();
+  sensorQueue = xQueueCreate(1, sizeof(SensorData_t)); // length 1 for xQueueOverwrite
+  sim800Queue = xQueueCreate(5, sizeof(Sim800Cmd_t));
+
+  // Create tasks
+  xTaskCreatePinnedToCore(TaskSensor, "SensorTask", 4096, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(TaskMQTT, "MQTTTask", 8192, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(TaskThingSpeak, "TSKTask", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(TaskSIM800, "SIM800Task", 8192, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(TaskLCD, "LCDTask", 4096, NULL, 1, NULL, 1);
+}
+
+void loop()
+{
+  // Nothing here; FreeRTOS tasks handle everything
+  delay(1000);
+}
+
+/* ---------------- Sensor Task ---------------- */
+void TaskSensor(void * pvParameters) 
+{
+  SensorData_t current;
+  SensorData_t prev = { -1.0, -1, -1, -1.0 };
+
+  for (;;) {
+    // Read sensors
+    current.humidity = dht.readHumidity();
+    current.moisture = analogRead(MoisturePin);
+    current.vibration = digitalRead(VibrationPin);
+    current.temp = readNTCTemperature();
+
+    bool changed = false;
+    if (!isnan(current.humidity) && fabs(current.humidity - prev.humidity) > 0.2) changed = true;
+    if (abs(current.moisture - prev.moisture) > 5) changed = true;
+    if (current.vibration != prev.vibration) changed = true;
+    if (fabs(current.temp - prev.temp) > 0.2) changed = true;
+
+    if (changed) 
+    {
+      // overwrite latest snapshot
+      xQueueOverwrite(sensorQueue, &current);
+      prev = current;
+    }
+
+    // Landslide condition (verify your moisture sensor: lower value might be dry/wet)
+    if (!isnan(current.humidity) &&
+        current.humidity > HumidityThreshold &&
+        current.moisture < MoistureThreshold &&
+        current.vibration == VibrationDetected)
+    {
+
+      // Alert: beep
+      digitalWrite(BuzzerPin, HIGH);
+      vTaskDelay(pdMS_TO_TICKS(500));
+      digitalWrite(BuzzerPin, LOW);
+
+      // Prepare and enqueue SIM800 SMSs/calls
+      Sim800Cmd_t cmd1;
+      cmd1.type = SIM800_SEND_SMS;
+      strncpy(cmd1.phone, "+919626901193", sizeof(cmd1.phone)-1); cmd1.phone[sizeof(cmd1.phone)-1]=0;
+      strncpy(cmd1.message, "Alert: Landslide detected!", sizeof(cmd1.message)-1); cmd1.message[sizeof(cmd1.message)-1]=0;
+      xQueueSend(sim800Queue, &cmd1, 0);
+
+      Sim800Cmd_t cmd2;
+      cmd2.type = SIM800_SEND_SMS;
+      strncpy(cmd2.phone, "+917812878328", sizeof(cmd2.phone)-1); cmd2.phone[sizeof(cmd2.phone)-1]=0;
+      strncpy(cmd2.message, "Alert: Landslide detected!", sizeof(cmd2.message)-1); cmd2.message[sizeof(cmd2.message)-1]=0;
+      xQueueSend(sim800Queue, &cmd2, 0);
+
+      Sim800Cmd_t call1;
+      call1.type = SIM800_CALL;
+      strncpy(call1.phone, "+919626901193", sizeof(call1.phone)-1); call1.phone[sizeof(call1.phone)-1]=0;
+      xQueueSend(sim800Queue, &call1, 0);
+
+      Sim800Cmd_t call2;
+      call2.type = SIM800_CALL;
+      strncpy(call2.phone, "+917812878328", sizeof(call2.phone)-1); call2.phone[sizeof(call2.phone)-1]=0;
+      xQueueSend(sim800Queue, &call2, 0);
+
+      // Survivor detection
+      if (current.temp >= HumanTempMin && current.temp <= HumanTempMax) {
+        Sim800Cmd_t survivor;
+        survivor.type = SIM800_SEND_SMS;
+        strncpy(survivor.phone, "+919626901193", sizeof(survivor.phone)-1); survivor.phone[sizeof(survivor.phone)-1]=0;
+        strncpy(survivor.message, "Survivor Detected!", sizeof(survivor.message)-1); survivor.message[sizeof(survivor.message)-1]=0;
+        xQueueSend(sim800Queue, &survivor, 0);
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(2000));
+  }
+}
+
+/* ---------------- MQTT Task ----------------
+   - consumes latest sensor snapshot and publishes only when different from lastSent
+*/
+void TaskMQTT(void * pvParameters) {
+  SensorData_t current;
+  for (;;) {
+    // receive latest sensor data (wait up to 2s)
+    if (xQueueReceive(sensorQueue, &current, pdMS_TO_TICKS(2000)) == pdTRUE) {
+      bool publishRequired = false;
+
+      // Compare with lastSent under mutex
+      if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100))) {
+        if (fabs(current.humidity - lastSent.humidity) > 0.2) publishRequired = true;
+        if (abs(current.moisture - lastSent.moisture) > 5) publishRequired = true;
+        if (current.vibration != lastSent.vibration) publishRequired = true;
+        if (fabs(current.temp - lastSent.temp) > 0.2) publishRequired = true;
+        if (publishRequired) {
+          publishMQTT("landslide/humidity", String(current.humidity, 1));
+          publishMQTT("landslide/moisture", String(current.moisture));
+          publishMQTT("landslide/vibration", String(current.vibration));
+          publishMQTT("landslide/temperature", String(current.temp, 1));
+          lastSent = current; // update protected by mutex
+        }
+        xSemaphoreGive(dataMutex);
+      }
+      else
+      {
+        Serial.println("Warning: could not take dataMutex to compare lastSent");
+      }
+    }
+
+    // Ensure MQTT is connected
+    if (!mqttClient.connected()) {
+      connectMQTT();
+    } else {
+      mqttClient.loop();
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+/* ---------------- ThingSpeak Task ---------------- */
+void TaskThingSpeak(void * pvParameters) {
+  SensorData_t snap;
+  for (;;) {
+    unsigned long now = millis();
+    if (now - lastThingSpeakUpdate >= 20000) {
+      if (xQueuePeek(sensorQueue, &snap, 0) == pdTRUE) {
+        ThingSpeak.setField(1, snap.humidity);
+        ThingSpeak.setField(2, snap.moisture);
+        ThingSpeak.setField(3, snap.vibration);
+        ThingSpeak.setField(4, snap.temp);
+        int statusCode = ThingSpeak.writeFields(myChannelNumber, myWriteAPIKey);
+        Serial.println(statusCode == 200 ? "ThingSpeak OK" : String("ThingSpeak Fail: ") + statusCode);
+
+        if (xSemaphoreTake(lcdMutex, pdMS_TO_TICKS(100))) {
+          lcd.clear();
+          lcd.setCursor(0,0);
+          lcd.print("ThingSpeak Uploaded");
+          xSemaphoreGive(lcdMutex);
+        }
+      }
+      lastThingSpeakUpdate = now;
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+/* ---------------- SIM800 Task ---------------- */
+void TaskSIM800(void * pvParameters) {
+  Sim800Cmd_t cmd;
+  for (;;) {
+    if (xQueueReceive(sim800Queue, &cmd, portMAX_DELAY) == pdTRUE) {
+      if (cmd.type == SIM800_SEND_SMS) {
+        sendSim800SMSBlocking(cmd.phone, cmd.message);
+      } else if (cmd.type == SIM800_CALL) {
+        makeSim800CallBlocking(cmd.phone);
+      }
+      vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+  }
+}
+
+/* ---------------- LCD Task ---------------- */
+void TaskLCD(void * pvParameters) {
+  for (;;) {
+    // Read lastSent under mutex
+    if (xSemaphoreTake(lcdMutex, pdMS_TO_TICKS(100))) {
+      if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100))) {
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.printf("H:%.1f%% M:%d", lastSent.humidity, lastSent.moisture);
+        lcd.setCursor(0, 1);
+        lcd.printf("V:%d T:%.1f", lastSent.vibration, lastSent.temp);
+        xSemaphoreGive(dataMutex);
+      } else {
+        // If we can't get dataMutex, still show something
+        lcd.clear();
+        lcd.setCursor(0,0);
+        lcd.print("Updating...");
+      }
+      xSemaphoreGive(lcdMutex);
+    }
+    vTaskDelay(pdMS_TO_TICKS(2000));
+  }
+}
+
+/* ---------------- Utility & Blocking SIM800 helpers ---------------- */
+void sendSim800SMSBlocking(const char* phone, const char* message) {
+  Serial.printf("SIM800 -> SMS to %s: %s\n", phone, message);
+  sim800.flush();
+  sim800.println("AT"); vTaskDelay(pdMS_TO_TICKS(200));
+  sim800.println("AT+CMGF=1"); vTaskDelay(pdMS_TO_TICKS(500));
+  sim800.print("AT+CMGS=\""); sim800.print(phone); sim800.println("\""); vTaskDelay(pdMS_TO_TICKS(500));
+  sim800.print(message); vTaskDelay(pdMS_TO_TICKS(500));
+  sim800.write(26); // ctrl+z to send
+  // wait for send to complete (basic delay). In production: read serial and wait for +CMGS / OK
+  vTaskDelay(pdMS_TO_TICKS(5000));
+  // flush any incoming bytes
+  while (sim800.available()) sim800.read();
+}
+
+void makeSim800CallBlocking(const char* phone) {
+  Serial.printf("SIM800 -> Call %s\n", phone);
+  sim800.flush();
+  sim800.print("ATD");
+  sim800.print(phone);
+  sim800.println(";");
+  // keep the call for 30s then hangup
+  vTaskDelay(pdMS_TO_TICKS(30000));
+  sim800.println("ATH");
+  vTaskDelay(pdMS_TO_TICKS(500));
+  while (sim800.available()) sim800.read();
+}
+
+/* MQTT publish wrapper */
+void publishMQTT(const char* topic, const String& message)
+{
+  if (!mqttClient.connected()) 
+  {
+    connectMQTT();
+  }
+  if (mqttClient.connected())
+  {
+    mqttClient.publish(topic, message.c_str());
+    Serial.print("MQTT -> "); Serial.print(topic); Serial.print(": "); Serial.println(message);
+  } else {
+    Serial.println("MQTT not connected, publish skipped");
+  }
+}
+
+/* Simple MQTT connect with limited retries */
+void connectMQTT() {
+  const int maxAttempts = 5;
+  int attempts = 0;
+  while (!mqttClient.connected() && attempts < maxAttempts) {
+    Serial.print("Attempting MQTT connection...");
+    if (mqttClient.connect("LandslideClient")) {
+      Serial.println("connected");
+      return;
+    } else {
+      Serial.print("failed, rc=");
+      Serial.println(mqttClient.state());
+      attempts++;
+      vTaskDelay(pdMS_TO_TICKS(2000 * attempts)); // backoff
+    }
+  }
+  if (!mqttClient.connected()) {
+    Serial.println("MQTT connect failed after attempts; will retry later in task loop.");
+  }
+}
+
+/* WiFi connect with timeout */
+bool ensureWiFiConnected(unsigned long timeoutMs) {
+  WiFi.begin(ssid, password);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    if (millis() - start > timeoutMs) {
+      return false;
+    }
+    Serial.print(".");
+    delay(500);
+  }
+  return true;
+}
+
+/* Read approximation for NTC temperature (improve with real thermistor formula) */
+float readNTCTemperature() {
+  int sensorValue = analogRead(NTCTempPin); // 0..4095
+  float voltage = sensorValue * (3.3f / 4095.0f);
+  // Placeholder conversion used previously; replace with correct thermistor conversion for accuracy
+  return (voltage - 0.5f) * 50.0f;
+}
